@@ -1,0 +1,414 @@
+import tkinter as tk
+from tkinter import messagebox, filedialog
+import mss
+import mss.tools
+from PIL import Image, ImageGrab, ImageTk
+import win32gui
+import win32con
+import win32ui
+import os
+import datetime
+
+class ScreenshotTool:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Python 截图小工具")
+        self.root.geometry("300x150")
+        self.root.resizable(False, False)
+        
+        # 居中显示
+        self.center_window()
+
+        # 创建主界面按钮
+        tk.Label(self.root, text="请选择截图模式:", font=("Arial", 12, "bold")).pack(pady=10)
+
+        btn_frame = tk.Frame(self.root)
+        btn_frame.pack(pady=5)
+
+        tk.Button(btn_frame, text="🖥️ 捕捉整个页面", command=self.capture_fullscreen, width=15).grid(row=0, column=0, padx=5, pady=5)
+        tk.Button(btn_frame, text="⬜ 捕捉矩形区域", command=self.start_region_selection, width=15).grid(row=0, column=1, padx=5, pady=5)
+        # tk.Button(btn_frame, text="🪟 捕捉窗口/对象", command=self.capture_window, width=15).grid(row=1, column=0, columnspan=2, padx=5, pady=5)
+
+    def center_window(self):
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.root.winfo_screenheight() // 2) - (height // 2)
+        self.root.geometry(f'{width}x{height}+{x}+{y}')
+
+    def get_filename(self):
+        """生成默认文件名"""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"screenshot_{timestamp}.png"
+
+    def save_image(self, img):
+        """保存图片并提示"""
+        filename = self.get_filename()
+        # 尝试直接保存，如果失败则转换格式
+        try:
+            img.save(filename)
+        except Exception:
+            # 如果是 win32 截图可能是 BMP 格式，转为 RGB 再存 PNG
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img.save(filename)
+
+        return filename
+
+    # --- 功能 1: 捕捉整个页面 ---
+    def capture_fullscreen(self):
+        self.root.withdraw() # 隐藏主窗口
+        # 等待窗口完全隐藏（增加延迟）
+        import time
+        time.sleep(0.2)
+        try:
+            with mss.mss() as sct:
+                # 捕获所有显示器
+                mon = sct.monitors[0] # 0 代表所有显示器的合并区域
+                screenshot = sct.grab(mon)
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                self.open_editor(img)
+        finally:
+            self.root.deiconify() # 显示主窗口
+
+    # --- 功能 2: 捕捉矩形区域 ---
+    def start_region_selection(self):
+        self.root.withdraw()
+        # 创建一个全屏透明遮罩层用于选择区域
+        selection_win = tk.Toplevel()
+        selection_win.attributes('-fullscreen', True)
+        selection_win.attributes('-alpha', 0.3) # 半透明
+        selection_win.configure(bg='gray')
+        selection_win.attributes('-topmost', True)
+        
+        # 移除标题栏
+        selection_win.overrideredirect(True)
+        
+        canvas = tk.Canvas(selection_win, cursor="cross", bg='gray')
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        start_x = None
+        start_y = None
+        rect_id = None
+
+        def on_mouse_press(event):
+            nonlocal start_x, start_y, rect_id
+            start_x = event.x
+            start_y = event.y
+            # 绘制一个初始矩形
+            rect_id = canvas.create_rectangle(start_x, start_y, start_x, start_y, outline='red', width=2)
+
+        def on_mouse_drag(event):
+            nonlocal rect_id
+            if rect_id:
+                canvas.coords(rect_id, start_x, start_y, event.x, event.y)
+
+        def on_mouse_release(event):
+            nonlocal start_x, start_y, rect_id
+            end_x = event.x
+            end_y = event.y
+            
+            # 确保坐标正确（处理反向拖动）
+            left = min(start_x, end_x)
+            top = min(start_y, end_y)
+            right = max(start_x, end_x)
+            bottom = max(start_y, end_y)
+            
+            selection_win.destroy() # 销毁遮罩层
+            
+            if right - left > 0 and bottom - top > 0:
+                self.perform_region_capture(left, top, right, bottom)
+            else:
+                self.root.deiconify()
+
+        canvas.bind("<ButtonPress-1>", on_mouse_press)
+        canvas.bind("<B1-Motion>", on_mouse_drag)
+        canvas.bind("<ButtonRelease-1>", on_mouse_release)
+        
+        # 按 ESC 取消
+        selection_win.bind("<Escape>", lambda e: selection_win.destroy())
+        
+        # 如果用户取消，需要恢复主窗口
+        def on_close():
+            self.root.deiconify()
+        selection_win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def perform_region_capture(self, left, top, right, bottom):
+        try:
+            with mss.mss() as sct:
+                monitor = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+                screenshot = sct.grab(monitor)
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                self.open_editor(img)
+        finally:
+            self.root.deiconify()
+
+    # --- 功能 3: 捕捉窗口/对象 ---
+    def capture_window(self):
+        self.root.withdraw()
+        # 创建窗口选择界面
+        self.create_window_selector()
+
+    def create_window_selector(self):
+        """创建窗口选择界面"""
+        import time
+        time.sleep(0.1)  # 等待主窗口完全隐藏
+
+        # 创建一个全屏遮罩窗口
+        selector_win = tk.Toplevel(self.root)
+        selector_win.attributes('-fullscreen', True)
+        selector_win.attributes('-alpha', 0.1)
+        selector_win.configure(bg='black')
+        selector_win.attributes('-topmost', True)
+        selector_win.overrideredirect(True)
+
+        # 提示标签
+        label = tk.Label(selector_win, text="请点击要截图的窗口\n按 ESC 取消",
+                        font=("Arial", 14), fg='white', bg='black')
+        label.place(relx=0.5, rely=0.05, anchor=tk.CENTER)
+
+        selected_hwnd = None
+
+        def update_highlight():
+            """更新高亮窗口"""
+            nonlocal selected_hwnd
+            try:
+                import ctypes
+                # 获取当前鼠标位置
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                pt = POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                point = (pt.x, pt.y)
+
+                # 获取鼠标位置的窗口
+                hwnd = win32gui.WindowFromPoint(point)
+
+                # 找到顶层窗口
+                while win32gui.GetParent(hwnd) != 0:
+                    hwnd = win32gui.GetParent(hwnd)
+
+                if hwnd and hwnd != selected_hwnd:
+                    selected_hwnd = hwnd
+                    # 绘制窗口高亮边框
+                    try:
+                        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                        canvas.delete("highlight")
+                        # 绿色边框
+                        canvas.create_rectangle(left, top, right, bottom,
+                                               outline='#00ff00', width=4, tags="highlight")
+                        # 红色内边框
+                        canvas.create_rectangle(left+2, top+2, right-2, bottom-2,
+                                               outline='#ff0000', width=1, tags="highlight")
+                        # 显示窗口标题
+                        title = win32gui.GetWindowText(hwnd)
+                        if title:
+                            canvas.create_rectangle(left, top-25, left+300, top,
+                                                   fill='black', outline='#00ff00', tags="highlight")
+                            canvas.create_text(left+5, top-12, text=title[:50],
+                                             fill='#00ff00', anchor=tk.W, font=("Arial", 10), tags="highlight")
+                    except:
+                        pass
+            except:
+                pass
+            # 每 50ms 更新一次
+            if selector_win.winfo_exists():
+                selector_win.after(50, update_highlight)
+
+        def on_mouse_click(event):
+            """鼠标点击时选择窗口并截图"""
+            try:
+                import ctypes
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+                pt = POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                point = (pt.x, pt.y)
+
+                hwnd = win32gui.WindowFromPoint(point)
+
+                # 找到顶层窗口
+                while win32gui.GetParent(hwnd) != 0:
+                    hwnd = win32gui.GetParent(hwnd)
+
+                if selected_hwnd and hwnd:
+                    selector_win.destroy()
+                    self.capture_selected_window(hwnd)
+            except Exception as e:
+                selector_win.destroy()
+                self.root.deiconify()
+                messagebox.showerror("错误", f"截取窗口失败:\n{str(e)}")
+
+        def on_escape(event):
+            """按 ESC 取消"""
+            selector_win.destroy()
+            self.root.deiconify()
+
+        # 创建画布
+        canvas = tk.Canvas(selector_win, bg='black', highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        # 绑定事件
+        selector_win.bind('<Button-1>', on_mouse_click)
+        selector_win.bind('<Escape>', on_escape)
+        selector_win.protocol("WM_DELETE_WINDOW",
+                             lambda: (selector_win.destroy(), self.root.deiconify()))
+
+        # 启动高亮更新
+        selector_win.after(100, update_highlight)
+
+        # 确保窗口在最前并获得焦点
+        selector_win.lift()
+        selector_win.focus_force()
+
+    def capture_selected_window(self, hwnd):
+        """截取选中的窗口"""
+        try:
+            # 获取窗口位置
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+            # 排除截图工具自己的窗口
+            if "Python 截图小工具" in win32gui.GetWindowText(hwnd):
+                self.root.deiconify()
+                messagebox.showwarning("提示", "不能截取截图工具自身的窗口")
+                return
+
+            width = right - left
+            height = bottom - top
+
+            if width <= 0 or height <= 0:
+                self.root.deiconify()
+                messagebox.showwarning("提示", "窗口尺寸无效")
+                return
+
+            # 使用 win32ui 进行高质量窗口截图
+            hwnd_dc = win32gui.GetWindowDC(hwnd)
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+
+            bitmap = win32ui.CreateBitmap()
+            bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+            save_dc.SelectObject(bitmap)
+
+            # BitBlt 从窗口 DC 复制
+            save_dc.BitBlt((0, 0), (width, height), mfc_dc, (0, 0), win32con.SRCCOPY)
+
+            # 转换为 PIL Image
+            bmpinfo = bitmap.GetInfo()
+            bmpstr = bitmap.GetBitmapBits(True)
+            img = Image.frombuffer('RGB', (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                                  bmpstr, 'raw', 'BGRX', 0, 1)
+
+            # 清理资源
+            win32gui.DeleteObject(bitmap.GetHandle())
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+            self.open_editor(img)
+
+        except Exception as e:
+            messagebox.showerror("错误", f"截取窗口失败:\n{str(e)}")
+        finally:
+            self.root.deiconify()
+
+    def open_editor(self, img):
+        """打开编辑器窗口"""
+        editor = tk.Toplevel(self.root)
+        editor.title("截图编辑器")
+        editor.geometry("800x600")
+        editor.state('zoomed')  # 最大化窗口
+
+        # 工具栏（放在顶部）
+        toolbar = tk.Frame(editor, bg='#f0f0f0', relief=tk.RAISED, bd=1)
+        toolbar.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+
+        tk.Button(toolbar, text="💾 保存", command=lambda: self.save_from_editor(editor, img),
+                 width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="💾 另存为", command=lambda: self.save_as_from_editor(editor, img),
+                 width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="📋 复制到剪贴板", command=lambda: self.copy_to_clipboard(img),
+                 width=12).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="❌ 关闭", command=editor.destroy,
+                 width=8).pack(side=tk.RIGHT, padx=5)
+
+        # 图片和画布
+        photo = ImageTk.PhotoImage(img)
+        self.editor_photo = photo
+        self.editor_img = img
+        self.editor_filename = None
+
+        canvas_frame = tk.Frame(editor)
+        canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(canvas_frame, bg='#404040')
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # 滚动条
+        v_scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scrollbar = tk.Scrollbar(editor, orient=tk.HORIZONTAL, command=canvas.xview)
+        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+        # 在画布上显示图片
+        canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+        canvas.config(scrollregion=canvas.bbox(tk.ALL))
+
+        # 窗口关闭事件
+        editor.protocol("WM_DELETE_WINDOW", editor.destroy)
+
+    def save_from_editor(self, editor, img):
+        """保存图片"""
+        if self.editor_filename:
+            try:
+                img.save(self.editor_filename)
+                messagebox.showinfo("成功", f"截图已保存:\n{os.path.abspath(self.editor_filename)}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存失败:\n{str(e)}")
+        else:
+            self.save_as_from_editor(editor, img)
+
+    def save_as_from_editor(self, editor, img):
+        """另存为图片"""
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG 图片", "*.png"), ("JPEG 图片", "*.jpg"), ("所有文件", "*.*")],
+            initialfile=self.get_filename()
+        )
+        if filename:
+            try:
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                img.save(filename)
+                self.editor_filename = filename
+                messagebox.showinfo("成功", f"截图已保存:\n{os.path.abspath(filename)}")
+            except Exception as e:
+                messagebox.showerror("错误", f"保存失败:\n{str(e)}")
+
+    def copy_to_clipboard(self, img):
+        """复制到剪贴板"""
+        try:
+            from io import BytesIO
+            output = BytesIO()
+            img.convert('RGB').save(output, 'BMP')
+            data = output.getvalue()[14:]  # 跳过 BMP 文件头
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+            win32clipboard.CloseClipboard()
+            messagebox.showinfo("成功", "已复制到剪贴板")
+        except Exception as e:
+            messagebox.showerror("错误", f"复制失败:\n{str(e)}")
+
+    def run(self):
+        self.root.mainloop()
+
+if __name__ == "__main__":
+    app = ScreenshotTool()
+    app.run()
